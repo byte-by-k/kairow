@@ -7,6 +7,43 @@ import org.postgresql.ds.PGSimpleDataSource;
 import static org.junit.jupiter.api.Assertions.*;
 
 class PollingQueueTest {
+    static final class OutboxHandler {
+        UUID processed;
+
+        @KairowPoll(table = "test_events", idColumn = "event_id", payloadColumn = "body")
+        public void publish(PollingQueue.Claim claim) {
+            processed = claim.id();
+        }
+    }
+
+    @Test void annotatedPollerClaimsAndCompletesMappedRow() throws Exception {
+        var db = database();
+        var handler = new OutboxHandler();
+        var poller = new AnnotatedPoller(handler, "publish", mapping ->
+                new PollingQueue(db, QueueBackend.postgresql(mapping)));
+        var id = UUID.randomUUID();
+        try (var tx = db.getConnection(); var sql = tx.createStatement()) {
+            sql.execute("CREATE TABLE test_events (LIKE polling_job INCLUDING ALL)");
+            try {
+                sql.execute("ALTER TABLE test_events RENAME COLUMN id TO event_id");
+                sql.execute("ALTER TABLE test_events RENAME COLUMN payload TO body");
+                try (var insert = tx.prepareStatement("INSERT INTO test_events(event_id,body,max_attempts) VALUES (?,'event',2)")) {
+                    insert.setObject(1, id);
+                    insert.executeUpdate();
+                }
+                assertTrue(poller.pollOnce("pod", Duration.ofMinutes(1), Duration.ZERO));
+                assertEquals(id, handler.processed);
+                assertFalse(poller.pollOnce("pod", Duration.ofMinutes(1), Duration.ZERO));
+                try (var rows = sql.executeQuery("SELECT status FROM test_events")) {
+                    assertTrue(rows.next());
+                    assertEquals("DONE", rows.getString(1));
+                }
+            } finally {
+                sql.execute("DROP TABLE test_events");
+            }
+        }
+    }
+
     private PGSimpleDataSource database() {
         var db = new PGSimpleDataSource();
         db.setURL(System.getenv().getOrDefault("POLLING_TEST_URL",

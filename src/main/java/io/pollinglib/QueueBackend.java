@@ -9,8 +9,11 @@ import io.pollinglib.PollingQueue.Claim;
 
 /** Stateless database operations. Implementations leave connection and transaction ownership to the caller. */
 public interface QueueBackend {
-    QueueBackend POSTGRESQL = new PostgresBackend();
-    QueueBackend MYSQL = new MysqlBackend();
+    QueueBackend POSTGRESQL = postgresql(QueueMapping.DEFAULT);
+    QueueBackend MYSQL = mysql(QueueMapping.DEFAULT);
+
+    static QueueBackend postgresql(QueueMapping mapping) { return new PostgresBackend(mapping); }
+    static QueueBackend mysql(QueueMapping mapping) { return new MysqlBackend(mapping); }
 
     void enqueue(Connection tx, UUID id, String payload, int maxAttempts) throws SQLException;
     /** Serialize the leadership decision and subsequent claim in the supplied transaction. */
