@@ -20,7 +20,7 @@ class AutomaticPollingTest {
         final CountDownLatch release = new CountDownLatch(1);
         final CountDownLatch invoked = new CountDownLatch(1);
 
-        @KairowPoll(table = "auto_jobs", strategy = KairowPoll.Strategy.MODULO,
+        @KairowPoll(table = "auto_jobs", dataSource = "${kairow.test-source}", strategy = KairowPoll.Strategy.MODULO,
                 shardIndex = "0", shardCount = "1", pollDelayMillis = 25, jobLeaseMillis = 1500)
         public void handle(PollingQueue.Claim claim) {
             invoked.countDown();
@@ -44,12 +44,25 @@ class AutomaticPollingTest {
                     insert.setObject(1, UUID.randomUUID());
                     insert.executeUpdate();
                 }
-                context.registerBean(DataSource.class, () -> db);
+                context.getEnvironment().getPropertySources().addFirst(new org.springframework.core.env.MapPropertySource(
+                        "test", java.util.Map.of("kairow.test-source", "orders")));
+                context.registerBean("orders", DataSource.class, () -> db);
+                context.registerBean("unused", DataSource.class, PGSimpleDataSource::new);
+                var adapterUsed = new java.util.concurrent.atomic.AtomicBoolean();
+                context.registerBean(QueueBackendProvider.class, () -> new QueueBackendProvider() {
+                    public boolean supports(String name) { return name.equals("PostgreSQL"); }
+                    public QueueBackend create(QueueMapping mapping) {
+                        assertEquals("auto_jobs", mapping.identifiers().get("table"));
+                        adapterUsed.set(true);
+                        return QueueBackend.postgresql(mapping);
+                    }
+                });
                 context.registerBean(Handler.class);
                 var registry = new io.micrometer.core.instrument.simple.SimpleMeterRegistry();
                 context.registerBean(io.micrometer.core.instrument.MeterRegistry.class, () -> registry);
                 context.register(App.class);
                 context.refresh();
+                assertTrue(adapterUsed.get());
                 var handler = context.getBean(Handler.class);
                 assertTrue(handler.invoked.await(10, TimeUnit.SECONDS));
                 var draining = java.util.concurrent.CompletableFuture.runAsync(context::stop);

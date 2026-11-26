@@ -84,7 +84,7 @@ Use a dedicated, empty PostgreSQL database. CI provisions PostgreSQL 16 and appl
 
 ## Automatic polling in Spring Boot 3
 
-Put Kairow on the application's classpath and annotate a public synchronous method on an eager singleton Spring bean. With a single or primary DataSource, Boot discovers the handler at startup, detects PostgreSQL or MySQL, and schedules one fixed-delay task per method. The application supplies the database driver and matching schema.
+Put Kairow on the application's classpath and annotate a public synchronous method on an eager singleton Spring bean. Boot discovers the handler at startup, resolves its DataSource and database adapter, and schedules one fixed-delay task per method. The application supplies the database driver and matching schema.
 
 ```java
 @KairowPoll(table = "kafka_outbox", idColumn = "event_id", payloadColumn = "event_body",
@@ -125,3 +125,16 @@ public void publish(PollingQueue.Claim event) {
 **Retries and metrics.** Fixed delay is the default. Exponential delay doubles per attempt up to the cap. Jitter of 0.2 samples between 80% and 100% of the capped delay. The row's max_attempts bounds deliveries; matching nonRetryable exceptions immediately fail the row. When a single or primary MeterRegistry bean is available, Kairow records kairow.claimed, kairow.completed, kairow.processing.failures, kairow.renewal.failures and kairow.processing.duration with table and handler tags. Processing failures include retryable, terminal and completion errors.
 
 **JUnit coverage.** Run `mvn verify` with PostgreSQL and the base schema. To include MySQL, also provision the MySQL test database as in the CI workflow and set `KAIROW_MYSQL_TEST=true`. The ordered-batch tests apply the actual companion migrations, exercise a competing transaction and verify retry and fencing behavior. The Spring integration test holds a handler open during shutdown and checks renewal, completion and metrics.
+
+## Pluggable data sources and database adapters
+
+```java
+@KairowPoll(table = "trade_outbox", dataSource = "${kairow.trade-source}")
+public void publishTrade(PollingQueue.Claim trade) {
+    publisher.sendAndAwaitAcknowledgment(trade.id(), trade.payload());
+}
+```
+
+Set `kairow.trade-source=tradesDataSource` to select an existing Spring JDBC DataSource bean. A literal bean name works too. Each handler can select its own pool. Omitting the attribute selects the single or primary DataSource. When several pools exist without a primary, name the pool on each handler. Kairow checks database metadata at startup and uses that same pool for claims, leadership, renewal, retries and completion. Run each queue migration on its selected database.
+
+PostgreSQL and MySQL have built-in backends. An adapter JAR can contribute a `QueueBackendProvider` bean via Spring Boot auto-configuration. Its `supports` method matches the JDBC product name; `create` receives that handler's QueueMapping. One matching provider takes precedence over the built-in adapter. Multiple matches fail startup. Custom adapters supply vendor SQL, migrations, lease renewal and the claim semantics their handlers require. The application's JDBC driver and connection pool still come from the host.
