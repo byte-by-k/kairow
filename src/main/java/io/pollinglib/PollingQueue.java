@@ -8,52 +8,54 @@ import java.util.Optional;
 import java.util.UUID;
 import javax.sql.DataSource;
 
-/** PostgreSQL queue shared by workers using the same writable database. */
+/** JDBC queue shared by workers using the same writable database. */
 public final class PollingQueue {
     public record Claim(UUID id, String payload, int attempt, UUID token) {}
 
     private final DataSource source;
 
-    private final String shardFilter;
+    private final QueueBackend backend;
+    private final int shardIndex;
+    private final int shardCount;
     private final UUID leaderToken = UUID.randomUUID();
     private final Duration leaderLease;
 
-    /** One active instance per database for the polling_job queue. */
-    public static PollingQueue singleActive(DataSource source, Duration leaderLease) {
-        if (leaderLease.toMillis() < 1) throw new IllegalArgumentException("Positive leader lease required");
-        return new PollingQueue(source, "", leaderLease);
-    }
-
     public PollingQueue(DataSource source) {
-        this(source, "", null);
+        this(source, QueueBackend.POSTGRESQL);
     }
 
-    /** Restricts this worker to one zero-based shard of the job UUID hash. */
-    public static PollingQueue modulo(DataSource source, int shardIndex, int shardCount) {
-        if (shardCount < 1 || shardIndex < 0 || shardIndex >= shardCount) {
-            throw new IllegalArgumentException("Expected 0 <= shardIndex < shardCount");
-        }
-        // Integer constants let PostgreSQL match an expression index for this shard count.
-        String filter = " AND mod((('x' || left(md5(id::text), 8))::bit(32)::bigint), "
-                + shardCount + ") = " + shardIndex;
-        return new PollingQueue(source, filter, null);
+    public PollingQueue(DataSource source, QueueBackend backend) {
+        this(source, backend, 0, 1, null);
     }
 
-    private PollingQueue(DataSource source, String shardFilter, Duration leaderLease) {
-        this.leaderLease = leaderLease;
-        this.shardFilter = shardFilter;
+    public static PollingQueue singleActive(DataSource source, Duration lease) {
+        return singleActive(source, QueueBackend.POSTGRESQL, lease);
+    }
+
+    public static PollingQueue singleActive(DataSource source, QueueBackend backend, Duration lease) {
+        if (lease.toMillis() < 1) throw new IllegalArgumentException("Positive leader lease required");
+        return new PollingQueue(source, backend, 0, 1, lease);
+    }
+
+    public static PollingQueue modulo(DataSource source, int index, int count) {
+        return modulo(source, QueueBackend.POSTGRESQL, index, count);
+    }
+
+    public static PollingQueue modulo(DataSource source, QueueBackend backend, int index, int count) {
+        if (count < 1 || index < 0 || index >= count) throw new IllegalArgumentException("Invalid shard");
+        return new PollingQueue(source, backend, index, count, null);
+    }
+
+    private PollingQueue(DataSource source, QueueBackend backend, int index, int count, Duration lease) {
         this.source = Objects.requireNonNull(source);
+        this.backend = Objects.requireNonNull(backend);
+        this.shardIndex = index;
+        this.shardCount = count;
+        this.leaderLease = lease;
     }
 
-    /** Uses the caller's transaction, so enqueue can commit with business data. */
     public void enqueue(Connection tx, UUID id, String payload, int maxAttempts) throws SQLException {
-        try (var statement = tx.prepareStatement(
-                "INSERT INTO polling_job (id, payload, max_attempts) VALUES (?, ?, ?)")) {
-            statement.setObject(1, id);
-            statement.setString(2, payload);
-            statement.setInt(3, maxAttempts);
-            statement.executeUpdate();
-        }
+        backend.enqueue(tx, id, payload, maxAttempts);
     }
 
     private Connection open() throws SQLException {
@@ -73,66 +75,15 @@ public final class PollingQueue {
             throw new IllegalArgumentException("Supply an owner and a positive lease of at least 1 ms");
         }
         try (var connection = open()) {
-            if (leaderLease == null) return claimDue(connection, owner, lease);
             connection.setAutoCommit(false);
             try {
-                var result = acquireLeadership(connection)
-                        ? claimDue(connection, owner, lease) : Optional.<Claim>empty();
+                var result = leaderLease == null || backend.acquireLeadership(connection, leaderToken, leaderLease)
+                        ? backend.claimDue(connection, owner, lease, shardIndex, shardCount) : Optional.<Claim>empty();
                 connection.commit();
                 return result;
             } catch (SQLException | RuntimeException failure) {
                 connection.rollback();
                 throw failure;
-            }
-        }
-    }
-
-    private boolean acquireLeadership(Connection connection) throws SQLException {
-        String sql = """
-            INSERT INTO polling_leader (queue_name, token, expires_at)
-            VALUES ('polling_job', ?, clock_timestamp() + ? * interval '1 millisecond')
-            ON CONFLICT (queue_name) DO UPDATE SET token = excluded.token,
-                expires_at = clock_timestamp() + ? * interval '1 millisecond'
-            WHERE polling_leader.token = excluded.token OR polling_leader.expires_at <= clock_timestamp()
-            """;
-        try (var statement = connection.prepareStatement(sql)) {
-            statement.setObject(1, leaderToken);
-            statement.setLong(2, leaderLease.toMillis());
-            statement.setLong(3, leaderLease.toMillis());
-            return statement.executeUpdate() == 1;
-        }
-    }
-
-    private Optional<Claim> claimDue(Connection connection, String owner, Duration lease) throws SQLException {
-        String sql = """
-            WITH candidate AS (
-                SELECT id FROM polling_job
-                WHERE status IN ('READY','PROCESSING') AND available_at <= statement_timestamp()
-                %s
-                ORDER BY available_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
-            )
-            UPDATE polling_job j SET
-                status = CASE WHEN attempts = max_attempts THEN 'FAILED' ELSE 'PROCESSING' END,
-                attempts = least(attempts::bigint + 1, max_attempts),
-                owner_id = CASE WHEN attempts < max_attempts THEN ? END,
-                claim_token = CASE WHEN attempts < max_attempts THEN CAST(? AS uuid) END,
-                available_at = statement_timestamp() + ? * interval '1 millisecond'
-            FROM candidate WHERE j.id = candidate.id
-            RETURNING j.id, payload, attempts, claim_token
-            """.formatted(shardFilter);
-        try (var statement = connection.prepareStatement(sql)) {
-            statement.setString(1, owner);
-            statement.setLong(3, lease.toMillis());
-            while (true) {
-                statement.setObject(2, UUID.randomUUID());
-                try (var rows = statement.executeQuery()) {
-                    if (!rows.next()) return Optional.empty();
-                    UUID token = rows.getObject(4, UUID.class);
-                    if (token != null) {
-                        return Optional.of(new Claim(rows.getObject(1, UUID.class),
-                                rows.getString(2), rows.getInt(3), token));
-                    }
-                }
             }
         }
     }
@@ -147,20 +98,8 @@ public final class PollingQueue {
     }
 
     private boolean finish(Claim claim, boolean success, Duration delay) throws SQLException {
-        String sql = """
-            UPDATE polling_job SET
-                status = CASE WHEN ? THEN 'DONE' WHEN attempts >= max_attempts THEN 'FAILED' ELSE 'READY' END,
-                available_at = statement_timestamp() + ? * interval '1 millisecond',
-                owner_id = NULL, claim_token = NULL
-            WHERE id = ? AND claim_token = ? AND status = 'PROCESSING'
-                AND available_at > statement_timestamp()
-            """;
-        try (var connection = open(); var statement = connection.prepareStatement(sql)) {
-            statement.setBoolean(1, success);
-            statement.setLong(2, delay.toMillis());
-            statement.setObject(3, claim.id());
-            statement.setObject(4, claim.token());
-            return statement.executeUpdate() == 1;
+        try (var connection = open()) {
+            return backend.finish(connection, claim, success, delay);
         }
     }
 }

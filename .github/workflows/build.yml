@@ -4,6 +4,15 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: polling
+          MYSQL_USER: kairow
+          MYSQL_PASSWORD: kairow
+        ports: ['3306:3306']
+        options: --health-cmd="mysqladmin ping -h localhost" --health-interval=5s --health-timeout=5s --health-retries=30
       postgres:
         image: postgres:16
         env:
@@ -19,4 +28,7 @@ jobs:
           java-version: '17'
           cache: maven
       - run: psql postgresql://postgres:postgres@localhost/polling -v ON_ERROR_STOP=1 -f src/main/resources/io/pollinglib/schema.sql
+      - run: mysql -h 127.0.0.1 -ukairow -pkairow polling < src/main/resources/io/pollinglib/mysql.sql
       - run: mvn -B verify
+        env:
+          KAIROW_MYSQL_TEST: 'true'

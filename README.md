@@ -1,6 +1,6 @@
 # Kairow
 
-Java 17 JDBC SDK for competing workers on a shared PostgreSQL database. A Spring Boot application can construct one PollingQueue with its pooled DataSource and invoke claim from a scheduled method on each pod. The host supplies the JDBC driver.
+Java 17 JDBC SDK for competing workers on a shared relational database. A Spring Boot application can construct one PollingQueue with its pooled DataSource and invoke claim from a scheduled method on each pod. The host supplies the JDBC driver.
 
 ## Why Kairow?
 
@@ -8,7 +8,21 @@ Kairow (pronounced *KAI-roh*) blends the Greek word *kairos*, meaning “the rig
 
 ## Usage
 
-Apply src/main/resources/io/pollinglib/schema.sql once through your migration tool. Call enqueue with a stable UUID and the same JDBC connection as your business transaction. Duplicate IDs raise a primary key violation.
+Choose a backend for the database behind the DataSource. Existing constructors default to PostgreSQL.
+
+| Database | Backend | Initial schema under src/main/resources/io/pollinglib |
+|---|---|---|
+| PostgreSQL | `QueueBackend.POSTGRESQL` | `schema.sql` (existing installations keep their tables) |
+| MySQL 8.0.16+ with InnoDB | `QueueBackend.MYSQL` | `mysql.sql` (includes the singleton leadership row) |
+
+```java
+var shared = new PollingQueue(dataSource, QueueBackend.MYSQL);
+var sharded = PollingQueue.modulo(dataSource, QueueBackend.MYSQL, shardIndex, shardCount);
+var leader = PollingQueue.singleActive(dataSource, QueueBackend.MYSQL, Duration.ofSeconds(30));
+```
+
+Apply the matching schema once. Use a consistent UTC session time zone on all MySQL connections and READ COMMITTED for the polling pool to reduce range locking. Provide the vendor driver in your application. For a different relational database, implement `QueueBackend` and provide its schema. The backend owns vendor SQL, atomic claiming, leadership and token-guarded updates. All pods working on the same queue must use the same database and backend.
+ Call enqueue with a stable UUID and the same JDBC connection as your business transaction. Duplicate IDs raise a primary key violation.
 
 A worker tick can process one job as follows:
 
@@ -60,7 +74,7 @@ Use one long-lived queue object per pod, and configure every pod for the same mo
 var queue = PollingQueue.singleActive(dataSource, Duration.ofSeconds(30));
 ```
 
-On each scheduled claim, the active pod renews its leadership in PostgreSQL, even when the queue is empty. Standbys check the leadership row and return an empty result without reading jobs. Renewal and the job claim share a transaction. If the leader stops renewing, another pod can take over on its next tick after expiry. Existing databases must apply the polling_leader CREATE TABLE statement at the end of schema.sql before enabling this mode.
+On each scheduled claim, the active pod renews its leadership in the database, even when the queue is empty. Standbys check the leadership row and return an empty result without reading jobs. Renewal and the job claim share a transaction. If the leader stops renewing, another pod can take over on its next tick after expiry. Existing databases must apply the polling_leader CREATE TABLE statement at the end of schema.sql before enabling this mode.
 
 Choose a leadership lease longer than the largest expected gap between claim calls, including handler time for a synchronous worker. The job lease passed to claim protects each individual job separately. A paused handler may still be running after leadership changes; downstream operations must tolerate redelivery. Shared and modulo pollers bypass this gate, so coordinate the rollout across all replicas.
 
