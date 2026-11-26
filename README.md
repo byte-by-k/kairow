@@ -82,25 +82,18 @@ Choose a leadership lease longer than the largest expected gap between claim cal
 
 Use a dedicated, empty PostgreSQL database. CI provisions PostgreSQL 16 and applies the schema. For local tests apply the schema, set POLLING_TEST_URL to the JDBC URL with test credentials, then run `mvn verify`. Run `mvn install` to install io.pollinglib:kairow:0.1.0-SNAPSHOT locally.
 
-## Annotated polling methods
+## Automatic polling in Spring Boot 3
 
-On a public synchronous handler, name the physical queue table and columns:
+Put Kairow on the application's classpath and annotate a public synchronous method on an eager singleton Spring bean. With a single or primary DataSource, Boot discovers the handler at startup, detects PostgreSQL or MySQL, and schedules one fixed-delay task per method. The application supplies the database driver and matching schema.
 
 ```java
-@KairowPoll(table = "kafka_outbox", idColumn = "event_id", payloadColumn = "event_body")
+@KairowPoll(table = "kafka_outbox", idColumn = "event_id", payloadColumn = "event_body",
+            strategy = KairowPoll.Strategy.SINGLE_ACTIVE, pollDelayMillis = 1000)
 public void publish(PollingQueue.Claim event) {
     publisher.sendAndAwaitAcknowledgment(event.id(), event.payload());
 }
 ```
 
-Bind the handler once at startup. Call the same poller from your scheduler on each tick:
-
-```java
-var poller = new AnnotatedPoller(handler, "publish",
-    mapping -> new PollingQueue(dataSource, QueueBackend.postgresql(mapping)));
-poller.pollOnce(podName, Duration.ofMinutes(2), Duration.ofSeconds(30));
-```
-
-For MySQL use QueueBackend.mysql(mapping). The factory also accepts a modulo or single-active queue. The host schedules ticks; the annotation supplies metadata. Successful returns complete the job, and handler exceptions schedule a retry subject to the attempt limit. Wait for asynchronous work to finish before returning. For Spring proxies bind a target exposing the annotated public method.
+Choose SHARED (default), MODULO or SINGLE_ACTIVE per method. For MODULO set kairow.shard-index per instance and kairow.shard-count across instances, or use the annotation's shardIndex and shardCount strings with literals or Spring placeholders. Set jobLeaseMillis, retryDelayMillis and leaderLeaseMillis as needed. On shutdown future ticks stop; an in-flight handler may finish. JDK proxies must expose the method on their interface. Set kairow.enabled=false if an existing application already schedules annotated handlers manually.
 
 The mapping uses the existing backend column types, status values and defaults, with retry and lease state stored on the source row. IDs must be UUIDs. Use ordinary unquoted identifiers; table names may include a schema. Map statusColumn, attemptsColumn, maxAttemptsColumn, availableAtColumn, ownerColumn and claimTokenColumn when their names differ. Apply the corresponding schema/index changes yourself. For single-active MySQL, seed polling_leader.queue_name with the exact configured table string (within its 64-character limit). Use identical table spelling across replicas.

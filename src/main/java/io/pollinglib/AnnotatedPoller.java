@@ -13,9 +13,13 @@ public final class AnnotatedPoller {
 
     public AnnotatedPoller(Object target, String methodName, Function<QueueMapping, PollingQueue> factory)
             throws NoSuchMethodException {
+        this(target, target.getClass().getMethod(methodName, PollingQueue.Claim.class),
+                target.getClass().getMethod(methodName, PollingQueue.Claim.class).getAnnotation(KairowPoll.class), factory);
+    }
+
+    AnnotatedPoller(Object target, Method method, KairowPoll annotation, Function<QueueMapping, PollingQueue> factory) {
         this.target = target;
-        method = target.getClass().getMethod(methodName, PollingQueue.Claim.class);
-        var annotation = method.getAnnotation(KairowPoll.class);
+        this.method = method;
         if (annotation == null || method.getReturnType() != void.class || !method.trySetAccessible())
             throw new IllegalArgumentException("Expected accessible @KairowPoll void handler(Claim)");
         queue = factory.apply(QueueMapping.from(annotation));

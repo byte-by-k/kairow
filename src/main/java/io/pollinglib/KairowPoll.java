@@ -5,6 +5,16 @@ import java.lang.annotation.*;
 @Retention(RetentionPolicy.RUNTIME)
 @Target(ElementType.METHOD)
 public @interface KairowPoll {
+    enum Strategy { SHARED, MODULO, SINGLE_ACTIVE }
+
+    Strategy strategy() default Strategy.SHARED;
+    long pollDelayMillis() default 1000;
+    long jobLeaseMillis() default 120000;
+    long leaderLeaseMillis() default 30000;
+    long retryDelayMillis() default 30000;
+    String shardIndex() default "${kairow.shard-index}";
+    String shardCount() default "${kairow.shard-count}";
+
     String table();
     String idColumn() default "id";
     String payloadColumn() default "payload";
