@@ -71,6 +71,11 @@ public final class PollingQueue {
 
     /** Claims one due job. Also retires expired final attempts before returning. */
     public Optional<Claim> claim(String owner, Duration lease) throws SQLException {
+        return claimBatch(owner, lease, 1).stream().findFirst();
+    }
+
+    public java.util.List<Claim> claimBatch(String owner, Duration lease, int size) throws SQLException {
+        if (size < 1) throw new IllegalArgumentException("Positive batch size required");
         if (owner == null || owner.isBlank() || lease.toMillis() < 1) {
             throw new IllegalArgumentException("Supply an owner and a positive lease of at least 1 ms");
         }
@@ -78,7 +83,7 @@ public final class PollingQueue {
             connection.setAutoCommit(false);
             try {
                 var result = leaderLease == null || backend.acquireLeadership(connection, leaderToken, leaderLease)
-                        ? backend.claimDue(connection, owner, lease, shardIndex, shardCount) : Optional.<Claim>empty();
+                        ? backend.claimBatch(connection, owner, lease, shardIndex, shardCount, size) : java.util.List.<Claim>of();
                 connection.commit();
                 return result;
             } catch (SQLException | RuntimeException failure) {
@@ -86,6 +91,15 @@ public final class PollingQueue {
                 throw failure;
             }
         }
+    }
+
+    public boolean renew(Claim claim, Duration lease) throws SQLException {
+        if (lease.toMillis() < 1) throw new IllegalArgumentException("Positive lease required");
+        try (var connection = open()) { return backend.renew(connection, claim, lease); }
+    }
+
+    public boolean fail(Claim claim) throws SQLException {
+        try (var connection = open()) { return backend.fail(connection, claim); }
     }
 
     public boolean complete(Claim claim) throws SQLException {

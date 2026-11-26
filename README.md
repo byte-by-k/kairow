@@ -1,6 +1,6 @@
 # Kairow
 
-Java 17 JDBC SDK for competing workers on a shared relational database. A Spring Boot application can construct one PollingQueue with its pooled DataSource and invoke claim from a scheduled method on each pod. The host supplies the JDBC driver.
+Kairow is a Java 17 polling SDK for PostgreSQL and MySQL. In Spring Boot 3, annotate a handler to claim rows in batches, process different aggregates concurrently, renew job leases, and publish Micrometer metrics. The host supplies the JDBC driver and database migrations.
 
 ## Why Kairow?
 
@@ -42,7 +42,7 @@ try {
 if (!queue.complete(job)) logger.warn("Lost claim for {}", job.id());
 ```
 
-Set the lease longer than the handler timeout. A crash or lease expiry permits redelivery. The unique claim token fences queue updates. Make downstream effects idempotent using the job ID. All pods must use one authoritative writable database. Independently writable databases require external coordination for split-brain protection.
+Manual JDBC workers can renew a live claim with `queue.renew(claim, lease)`. Size the lease for the longest gap between renewals. A crash or lease expiry permits redelivery. The unique claim token fences queue updates. Make downstream effects idempotent using the job ID. All pods must use one authoritative writable database. Independently writable databases require external coordination for split-brain protection.
 
 ## Polling across instances
 
@@ -96,4 +96,32 @@ public void publish(PollingQueue.Claim event) {
 
 Choose SHARED (default), MODULO or SINGLE_ACTIVE per method. For MODULO set kairow.shard-index per instance and kairow.shard-count across instances, or use the annotation's shardIndex and shardCount strings with literals or Spring placeholders. Set jobLeaseMillis, retryDelayMillis and leaderLeaseMillis as needed. On shutdown future ticks stop; an in-flight handler may finish. JDK proxies must expose the method on their interface. Set kairow.enabled=false if an existing application already schedules annotated handlers manually.
 
-The mapping uses the existing backend column types, status values and defaults, with retry and lease state stored on the source row. IDs must be UUIDs. Use ordinary unquoted identifiers; table names may include a schema. Map statusColumn, attemptsColumn, maxAttemptsColumn, availableAtColumn, ownerColumn and claimTokenColumn when their names differ. Apply the corresponding schema/index changes yourself. For single-active MySQL, seed polling_leader.queue_name with the exact configured table string (within its 64-character limit). Use identical table spelling across replicas.
+The mapping uses the existing backend column types, status values and defaults, with retry and lease state stored on the source row by default. IDs must be UUIDs. Use ordinary unquoted identifiers; table names may include a schema. Map statusColumn, attemptsColumn, maxAttemptsColumn, availableAtColumn, ownerColumn and claimTokenColumn when their names differ. Apply the corresponding schema/index changes yourself. For single-active MySQL, seed polling_leader.queue_name with the exact configured table string (within its 64-character limit). Use identical table spelling across replicas.
+
+## Ordered outbox processing
+
+```java
+@KairowPoll(
+    table = "outbox", companionStateTable = "outbox_state",
+    aggregateKeyColumn = "aggregate_id", aggregateSequenceColumn = "event_version",
+    batchSize = 8, jobLeaseMillis = 60_000,
+    retryBackoff = KairowPoll.Backoff.EXPONENTIAL, retryDelayMillis = 1_000,
+    maxRetryDelayMillis = 30_000, retryJitter = 0.2,
+    nonRetryable = IllegalArgumentException.class)
+public void publish(PollingQueue.Claim event) {
+    publisher.sendAndAwaitAcknowledgment(event.id(), event.payload());
+}
+```
+
+**Ordering.** Configure both columns on every consumer of the queue. Use immutable, non-null keys and sequences with a unique index on the pair. Producers must commit each aggregate's events in sequence order, for example by locking the aggregate row in the business transaction. Kairow selects the lowest unfinished committed sequence for each key. A delayed retry, live claim or terminal failure blocks later versions of that aggregate, including across modulo shards. After investigating a failure, explicitly requeue it or mark it resolved. Independent aggregates continue. Delivery is at least once; use the event ID for downstream idempotency.
+
+**Companion state.** For an append-only outbox the supplied migrations backfill a separate queue and install an insert trigger. Each new event and its companion row commit together; the row stores an immutable payload snapshot, ordering columns and operational state. Business-table updates and deletes are outside this insert-based model. Adapt one migration to the actual source column names and types before enabling the poller. In companion mode the annotation's column mappings apply to the companion table. Each source needs its own companion table. Retain completed rows according to your application's replay and audit rules.
+
+- [PostgreSQL migration](src/main/resources/io/pollinglib/examples/postgres-companion.sql)
+- [MySQL migration](src/main/resources/io/pollinglib/examples/mysql-companion.sql)
+
+**Batching and shutdown.** Each tick locks up to `batchSize` eligible rows in one transaction and batches the updates. Spring runs one worker per claimed row and waits for that batch before polling again. The default batch size is one; the maximum is 256 per handler. Handlers using larger batches must be thread-safe. Size the connection pool for processing and heartbeat traffic. Job leases renew approximately every third of the lease duration while processing. A database outage or paused JVM can still cause redelivery. The separate single-active leadership lease renews on claim ticks, so allow for the duration of a batch when choosing it. Shutdown stops new ticks and drains running work with heartbeats for `kairow.shutdown-grace-millis` (default 30000). On timeout Kairow requests interruption and stops heartbeats; outstanding claims become recoverable after expiry.
+
+**Retries and metrics.** Fixed delay is the default. Exponential delay doubles per attempt up to the cap. Jitter of 0.2 samples between 80% and 100% of the capped delay. The row's max_attempts bounds deliveries; matching nonRetryable exceptions immediately fail the row. When a single or primary MeterRegistry bean is available, Kairow records kairow.claimed, kairow.completed, kairow.processing.failures, kairow.renewal.failures and kairow.processing.duration with table and handler tags. Processing failures include retryable, terminal and completion errors.
+
+**JUnit coverage.** Run `mvn verify` with PostgreSQL and the base schema. To include MySQL, also provision the MySQL test database as in the CI workflow and set `KAIROW_MYSQL_TEST=true`. The ordered-batch tests apply the actual companion migrations, exercise a competing transaction and verify retry and fencing behavior. The Spring integration test holds a handler open during shutdown and checks renewal, completion and metrics.
