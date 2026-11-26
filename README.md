@@ -2,6 +2,68 @@
 
 Kairow is a Java 17 polling SDK for PostgreSQL and MySQL. In Spring Boot 3, annotate a handler to claim rows in batches, process different aggregates concurrently, renew job leases, and publish Micrometer metrics. The host supplies the JDBC driver and database migrations.
 
+## Choose a usage example
+
+| Use case | Example |
+|---|---|
+| Let all Spring replicas share a queue | [Spring Boot quick start](#spring-boot-quick-start) |
+| Assign jobs to fixed worker shards | [Modulo workers](#modulo-workers) |
+| Keep one active poller and other pods on standby | [Annotated single-active handler](#automatic-polling-in-spring-boot-3) |
+| Publish ordered trade events with retries and batching | [Ordered outbox processing](#ordered-outbox-processing) |
+| Select a database per handler or install an adapter | [Pluggable data sources](#pluggable-data-sources-and-database-adapters) |
+| Poll from plain Java or an existing scheduler | [Manual JDBC polling](#usage) |
+
+## Spring Boot quick start
+
+From the Kairow checkout, run `mvn -DskipTests install` to install the snapshot into your local Maven repository. In your Spring Boot 3 application add:
+
+```xml
+<dependency>
+    <groupId>io.pollinglib</groupId>
+    <artifactId>kairow</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+</dependency>
+```
+
+Configure a JDBC DataSource with the vendor driver and apply [the PostgreSQL schema](src/main/resources/io/pollinglib/schema.sql) or [the MySQL schema](src/main/resources/io/pollinglib/mysql.sql). Put this bean in a package scanned by your application:
+
+```java
+import io.pollinglib.KairowPoll;
+import io.pollinglib.PollingQueue;
+import org.springframework.stereotype.Component;
+
+@Component
+public class JobHandler {
+    @KairowPoll(table = "polling_job")
+    public void process(PollingQueue.Claim job) {
+        System.out.println("Processing " + job.id() + ": " + job.payload());
+    }
+}
+```
+
+For a quick check, insert a row in a fresh queue. Each replica can claim it; once its handler returns successfully the row becomes DONE.
+
+```sql
+INSERT INTO polling_job (id, payload, max_attempts)
+VALUES ('a65a8358-59af-4aa3-a33c-bf7294118e98', 'hello Kairow', 3);
+```
+
+## Modulo workers
+
+To partition the quick-start queue, replace the annotation on the same method with:
+
+```java
+@KairowPoll(table = "polling_job", strategy = KairowPoll.Strategy.MODULO,
+            shardIndex = "${kairow.shard-index}", shardCount = "${kairow.shard-count}")
+```
+
+For two instances, use the following settings on the first. Set shard-index to 1 on the second. If a shard has no live worker, its jobs wait for a replacement.
+
+```properties
+kairow.shard-index=0
+kairow.shard-count=2
+```
+
 ## Why Kairow?
 
 Kairow (pronounced *KAI-roh*) blends the Greek word *kairos*, meaning “the right moment,” with *row*, the PostgreSQL record that holds a job. A worker can claim that row when a new job is ready, a retry becomes due, or a previous worker’s lease expires. The name captures what the framework helps a worker find: the right row at the right moment.
