@@ -13,7 +13,7 @@ public final class QueueMapping {
     private static final Pattern SLOT = Pattern.compile("\\{([a-z_]+)\\}");
     private static final String IDENT = "[A-Za-z_][A-Za-z0-9_]*";
     static final QueueMapping DEFAULT = new QueueMapping("polling_job", "polling_leader", Map.of());
-    private final Map<String,String> names;
+    private Map<String,String> names;
 
     public QueueMapping(String table, String leaderTable, Map<String,String> columns) {
         var result = new HashMap<String,String>();
@@ -34,8 +34,19 @@ public final class QueueMapping {
         names = Map.copyOf(result);
     }
 
+    private boolean ordered;
+
+    String orderGuard() {
+        if (!ordered) return "";
+        return """
+             AND NOT EXISTS (SELECT 1 FROM {table} prior
+                 WHERE prior.{aggregate_key}=job.{aggregate_key}
+                 AND prior.{sequence}<job.{sequence} AND prior.{status}<>'DONE')
+            """;
+    }
+
     static QueueMapping from(KairowPoll a) {
-        return new QueueMapping(a.table(), a.leaderTable(), Map.of(
+        var mapping = new QueueMapping(a.companionStateTable().isEmpty() ? a.table() : a.companionStateTable(), a.leaderTable(), Map.of(
                 "id", a.idColumn(),
                 "payload", a.payloadColumn(),
                 "status", a.statusColumn(),
@@ -44,6 +55,16 @@ public final class QueueMapping {
                 "available_at", a.availableAtColumn(),
                 "owner_id", a.ownerColumn(),
                 "claim_token", a.claimTokenColumn()));
+        if (!a.aggregateKeyColumn().isEmpty() || !a.aggregateSequenceColumn().isEmpty()) {
+            if (!a.aggregateKeyColumn().matches(IDENT) || !a.aggregateSequenceColumn().matches(IDENT))
+                throw new IllegalArgumentException("Supply both aggregate key and sequence column names");
+            var names = new HashMap<>(mapping.names);
+            names.put("aggregate_key", a.aggregateKeyColumn());
+            names.put("sequence", a.aggregateSequenceColumn());
+            mapping.names = Map.copyOf(names);
+            mapping.ordered = true;
+        }
+        return mapping;
     }
 
     PreparedStatement prepare(Connection tx, String template) throws SQLException {

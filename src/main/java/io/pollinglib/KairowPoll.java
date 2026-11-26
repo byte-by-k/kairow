@@ -7,6 +7,16 @@ import java.lang.annotation.*;
 public @interface KairowPoll {
     enum Strategy { SHARED, MODULO, SINGLE_ACTIVE }
 
+    enum Backoff { FIXED, EXPONENTIAL }
+
+    String aggregateKeyColumn() default "";
+    String aggregateSequenceColumn() default "";
+    String companionStateTable() default "";
+    int batchSize() default 1;
+    Backoff retryBackoff() default Backoff.FIXED;
+    long maxRetryDelayMillis() default Long.MAX_VALUE;
+    double retryJitter() default 0;
+    Class<? extends Exception>[] nonRetryable() default {};
     Strategy strategy() default Strategy.SHARED;
     long pollDelayMillis() default 1000;
     long jobLeaseMillis() default 120000;

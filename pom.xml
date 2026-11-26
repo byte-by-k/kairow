@@ -3,11 +3,16 @@
   <groupId>io.pollinglib</groupId>
   <artifactId>kairow</artifactId>
   <version>0.1.0-SNAPSHOT</version>
+  <name>Kairow</name>
+  <description>JDBC polling for Spring with ordered batch claims, renewable leases and retry policies.</description>
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
   </properties>
   <dependencies>
+    <dependency>
+      <groupId>io.micrometer</groupId><artifactId>micrometer-core</artifactId><version>1.15.5</version>
+    </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId><artifactId>spring-boot-autoconfigure</artifactId><version>3.5.7</version><optional>true</optional>
     </dependency>

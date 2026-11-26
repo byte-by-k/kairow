@@ -23,6 +23,11 @@ final class KairowScheduler implements SmartLifecycle {
     private final Environment env;
     private final String owner = UUID.randomUUID().toString();
     private volatile ScheduledThreadPoolExecutor executor;
+    private ScheduledThreadPoolExecutor heartbeat;
+    private java.util.concurrent.ExecutorService workers;
+    private int capacity;
+    private volatile boolean stopping;
+    private long graceMillis;
 
     KairowScheduler(ConfigurableListableBeanFactory beans, DataSource source, Environment env) {
         this.beans = beans;
@@ -35,6 +40,10 @@ final class KairowScheduler implements SmartLifecycle {
     @Override
     public synchronized void start() {
         if (executor != null) return;
+        capacity = 0;
+        stopping = false;
+        graceMillis = env.getProperty("kairow.shutdown-grace-millis", Long.class, 30000L);
+        if (graceMillis < 0) throw new IllegalArgumentException("Invalid shutdown grace");
         var tasks = new ArrayList<Task>();
         String database = null;
         for (String name : beans.getSingletonNames()) {
@@ -47,6 +56,9 @@ final class KairowScheduler implements SmartLifecycle {
                 tasks.add(bind(bean, entry.getKey(), entry.getValue(), database));
             }
         }
+        workers = java.util.concurrent.Executors.newFixedThreadPool(Math.max(1, capacity));
+        heartbeat = new ScheduledThreadPoolExecutor(Math.max(1, capacity));
+        heartbeat.setRemoveOnCancelPolicy(true);
         executor = new ScheduledThreadPoolExecutor(Math.max(1, tasks.size()));
         executor.setContinueExistingPeriodicTasksAfterShutdownPolicy(false);
         for (var task : tasks) executor.scheduleWithFixedDelay(task.run(), 0, task.delay(), TimeUnit.MILLISECONDS);
@@ -67,6 +79,10 @@ final class KairowScheduler implements SmartLifecycle {
             throw new IllegalArgumentException("Expected public void handler(PollingQueue.Claim): " + method);
         if (a.pollDelayMillis() < 1 || a.jobLeaseMillis() < 1 || a.retryDelayMillis() < 0)
             throw new IllegalArgumentException("Invalid poll, lease or retry timing on " + method);
+        if (a.batchSize() < 1 || a.batchSize() > 256 || a.maxRetryDelayMillis() < 0 ||
+                !(a.retryJitter() >= 0 && a.retryJitter() <= 1))
+            throw new IllegalArgumentException("Invalid batch size or retry policy on " + method);
+        capacity = Math.addExact(capacity, a.batchSize());
         var invocable = AopUtils.selectInvocableMethod(method, bean.getClass());
         var poller = new AnnotatedPoller(bean, invocable, a, mapping -> {
             var backend = switch (database) {
@@ -80,13 +96,50 @@ final class KairowScheduler implements SmartLifecycle {
                 case MODULO -> PollingQueue.modulo(source, backend, shardNumber(a.shardIndex()), shardNumber(a.shardCount()));
             };
         });
+        var registry = beans.getBeanProvider(io.micrometer.core.instrument.MeterRegistry.class).getIfUnique();
+        var metrics = new PollMetrics(registry, a.table(), method.getName());
+        var lease = Duration.ofMillis(a.jobLeaseMillis());
         return new Task(() -> {
+            if (stopping) return;
             try {
-                poller.pollOnce(owner, Duration.ofMillis(a.jobLeaseMillis()), Duration.ofMillis(a.retryDelayMillis()));
-            } catch (Exception e) {
-                LOG.log(System.Logger.Level.ERROR, "Kairow poll failed for " + method, e);
+                var batch = poller.queue.claimBatch(owner, lease, a.batchSize());
+                metrics.claimed(batch.size());
+                var jobs = new ArrayList<java.util.concurrent.Callable<Void>>();
+                for (var claim : batch) jobs.add(() -> {
+                    processClaim(poller, claim, a, lease, metrics);
+                    return null;
+                });
+                for (var result : workers.invokeAll(jobs)) result.get();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            } catch (Exception failure) {
+                LOG.log(System.Logger.Level.ERROR, "Kairow poll failed for " + method, failure);
             }
         }, a.pollDelayMillis());
+    }
+
+    private void processClaim(AnnotatedPoller poller, PollingQueue.Claim claim, KairowPoll options,
+                              Duration lease, PollMetrics metrics) {
+        long interval = Math.max(1, lease.toMillis() / 3);
+        var renewal = heartbeat.scheduleWithFixedDelay(() -> {
+            try {
+                if (!poller.queue.renew(claim, lease)) metrics.renewalFailure();
+            } catch (SQLException failure) {
+                metrics.renewalFailure();
+                LOG.log(System.Logger.Level.WARNING, "Lease renewal failed for " + claim.id(), failure);
+            }
+        }, interval, interval, TimeUnit.MILLISECONDS);
+        long started = System.nanoTime();
+        try {
+            poller.process(claim, Duration.ofMillis(options.retryDelayMillis()));
+            metrics.completed();
+        } catch (Exception failure) {
+            metrics.failure();
+            LOG.log(System.Logger.Level.ERROR, "Handler failed for " + claim.id(), failure);
+        } finally {
+            renewal.cancel(false);
+            metrics.elapsed(System.nanoTime() - started);
+        }
     }
 
     private int shardNumber(String value) {
@@ -95,7 +148,18 @@ final class KairowScheduler implements SmartLifecycle {
 
     @Override
     public synchronized void stop() {
-        if (executor != null) executor.shutdown();
+        if (executor == null) return;
+        stopping = true;
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(graceMillis, TimeUnit.MILLISECONDS)) executor.shutdownNow();
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
+        } finally {
+            workers.shutdownNow();
+            heartbeat.shutdownNow();
+        }
         executor = null;
     }
 

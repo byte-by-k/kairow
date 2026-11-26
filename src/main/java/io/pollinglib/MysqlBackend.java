@@ -7,12 +7,8 @@ import java.util.Optional;
 import java.util.UUID;
 import io.pollinglib.PollingQueue.Claim;
 
-final class MysqlBackend implements QueueBackend {
-    private final QueueMapping mapping;
-
-    MysqlBackend(QueueMapping mapping) {
-        this.mapping = mapping;
-    }
+final class MysqlBackend extends JdbcClaimBackend {
+    MysqlBackend(QueueMapping mapping) { super(mapping, true); }
 
     public void enqueue(Connection tx, UUID id, String payload, int maxAttempts) throws SQLException {
         try (var s = mapping.prepare(tx, "INSERT INTO {table}({id},{payload},{max_attempts}) VALUES (?,?,?)")) {
@@ -37,43 +33,6 @@ final class MysqlBackend implements QueueBackend {
             s.setLong(2, micros(lease));
             s.setString(3, token.toString());
             return s.executeUpdate() == 1;
-        }
-    }
-
-    public Optional<Claim> claimDue(Connection tx, String owner, Duration lease, int index, int count) throws SQLException {
-        String shard = count == 1 ? "" : " AND MOD(CAST(CONV(LEFT(MD5({id}),8),16,10) AS UNSIGNED), ?) = ?";
-        String sql = "SELECT {id},{payload},{attempts},{max_attempts} FROM {table} WHERE {status} IN ('READY','PROCESSING')"
-                + " AND {available_at}<=CURRENT_TIMESTAMP(6)" + shard + " ORDER BY {available_at},{id} LIMIT 1 FOR UPDATE SKIP LOCKED";
-        try (var select = mapping.prepare(tx, sql)) {
-            if (count > 1) {
-                select.setInt(1, count);
-                select.setInt(2, index);
-            }
-            while (true) {
-                try (var rows = select.executeQuery()) {
-                    if (!rows.next()) return Optional.empty();
-                    UUID id = UUID.fromString(rows.getString(1));
-                    if (rows.getInt(3) >= rows.getInt(4)) {
-                        try (var retire = mapping.prepare(tx, "UPDATE {table} SET {status}='FAILED',{claim_token}=NULL,{owner_id}=NULL WHERE {id}=?")) {
-                            retire.setString(1, id.toString());
-                            retire.executeUpdate();
-                        }
-                        continue;
-                    }
-                    var claim = new Claim(id, rows.getString(2), rows.getInt(3) + 1, UUID.randomUUID());
-                    try (var update = mapping.prepare(tx, """
-                            UPDATE {table} SET {status}='PROCESSING',{attempts}={attempts}+1,{owner_id}=?,{claim_token}=?,
-                            {available_at}=TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)) WHERE {id}=?
-                            """)) {
-                        update.setString(1, owner);
-                        update.setString(2, claim.token().toString());
-                        update.setLong(3, micros(lease));
-                        update.setString(4, id.toString());
-                        update.executeUpdate();
-                    }
-                    return Optional.of(claim);
-                }
-            }
         }
     }
 
