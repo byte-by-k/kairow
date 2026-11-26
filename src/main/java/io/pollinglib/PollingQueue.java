@@ -14,7 +14,25 @@ public final class PollingQueue {
 
     private final DataSource source;
 
+    private final String shardFilter;
+
     public PollingQueue(DataSource source) {
+        this(source, "");
+    }
+
+    /** Restricts this worker to one zero-based shard of the job UUID hash. */
+    public static PollingQueue modulo(DataSource source, int shardIndex, int shardCount) {
+        if (shardCount < 1 || shardIndex < 0 || shardIndex >= shardCount) {
+            throw new IllegalArgumentException("Expected 0 <= shardIndex < shardCount");
+        }
+        // Integer constants let PostgreSQL match an expression index for this shard count.
+        String filter = " AND mod((('x' || left(md5(id::text), 8))::bit(32)::bigint), "
+                + shardCount + ") = " + shardIndex;
+        return new PollingQueue(source, filter);
+    }
+
+    private PollingQueue(DataSource source, String shardFilter) {
+        this.shardFilter = shardFilter;
         this.source = Objects.requireNonNull(source);
     }
 
@@ -49,6 +67,7 @@ public final class PollingQueue {
             WITH candidate AS (
                 SELECT id FROM polling_job
                 WHERE status IN ('READY','PROCESSING') AND available_at <= statement_timestamp()
+                %s
                 ORDER BY available_at, id LIMIT 1 FOR UPDATE SKIP LOCKED
             )
             UPDATE polling_job j SET
@@ -59,7 +78,7 @@ public final class PollingQueue {
                 available_at = statement_timestamp() + ? * interval '1 millisecond'
             FROM candidate WHERE j.id = candidate.id
             RETURNING j.id, payload, attempts, claim_token
-            """;
+            """.formatted(shardFilter);
         try (var connection = open(); var statement = connection.prepareStatement(sql)) {
             statement.setString(1, owner);
             statement.setLong(3, lease.toMillis());

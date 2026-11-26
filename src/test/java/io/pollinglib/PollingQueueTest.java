@@ -7,10 +7,42 @@ import org.postgresql.ds.PGSimpleDataSource;
 import static org.junit.jupiter.api.Assertions.*;
 
 class PollingQueueTest {
-    @Test void lockedRowsRecoveryAndRetryLimit() throws Exception {
+    private PGSimpleDataSource database() {
         var db = new PGSimpleDataSource();
         db.setURL(System.getenv().getOrDefault("POLLING_TEST_URL",
                 "jdbc:postgresql://localhost:5432/polling?user=postgres&password=postgres"));
+        return db;
+    }
+
+    @Test void moduloRoutesExistingRowsAndRetriesToTheirShard() throws Exception {
+        var db = database();
+        var shared = new PollingQueue(db);
+        var even = PollingQueue.modulo(db, 0, 2);
+        var odd = PollingQueue.modulo(db, 1, 2);
+        var lease = Duration.ofMinutes(1);
+        assertThrows(IllegalArgumentException.class, () -> PollingQueue.modulo(db, 2, 2));
+        var evenId = UUID.fromString("00000000-0000-0000-0000-000000000000");
+        var oddId = UUID.fromString("00000000-0000-0000-0000-000000000005");
+        try (var tx = db.getConnection()) {
+            shared.enqueue(tx, evenId, "even", 2);
+            shared.enqueue(tx, oddId, "odd", 2);
+        }
+        var first = even.claim("a", lease).orElseThrow();
+        assertEquals(evenId, first.id());
+        assertTrue(even.claim("a", lease).isEmpty());
+        var second = odd.claim("b", lease).orElseThrow();
+        assertEquals(oddId, second.id());
+        assertTrue(odd.complete(second));
+        assertTrue(even.retry(first, Duration.ZERO));
+        assertTrue(odd.claim("b", lease).isEmpty());
+        var retry = even.claim("replacement", lease).orElseThrow();
+        assertEquals(evenId, retry.id());
+        assertEquals(2, retry.attempt());
+        assertTrue(even.complete(retry));
+    }
+
+    @Test void lockedRowsRecoveryAndRetryLimit() throws Exception {
+        var db = database();
         var queue = new PollingQueue(db);
         var id = UUID.randomUUID();
         var lease = Duration.ofMinutes(2);
