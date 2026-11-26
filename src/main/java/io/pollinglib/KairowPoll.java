@@ -25,6 +25,7 @@ public @interface KairowPoll {
     String shardIndex() default "${kairow.shard-index}";
     String shardCount() default "${kairow.shard-count}";
 
+    String dataSource() default "";
     String table();
     String idColumn() default "id";
     String payloadColumn() default "payload";

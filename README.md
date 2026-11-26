@@ -2,6 +2,68 @@
 
 Kairow is a Java 17 polling SDK for PostgreSQL and MySQL. In Spring Boot 3, annotate a handler to claim rows in batches, process different aggregates concurrently, renew job leases, and publish Micrometer metrics. The host supplies the JDBC driver and database migrations.
 
+## Choose a usage example
+
+| Use case | Example |
+|---|---|
+| Let all Spring replicas share a queue | [Spring Boot quick start](#spring-boot-quick-start) |
+| Assign jobs to fixed worker shards | [Modulo workers](#modulo-workers) |
+| Keep one active poller and other pods on standby | [Annotated single-active handler](#automatic-polling-in-spring-boot-3) |
+| Publish ordered trade events with retries and batching | [Ordered outbox processing](#ordered-outbox-processing) |
+| Select a database per handler or install an adapter | [Pluggable data sources](#pluggable-data-sources-and-database-adapters) |
+| Poll from plain Java or an existing scheduler | [Manual JDBC polling](#usage) |
+
+## Spring Boot quick start
+
+From the Kairow checkout, run `mvn -DskipTests install` to install the snapshot into your local Maven repository. In your Spring Boot 3 application add:
+
+```xml
+<dependency>
+    <groupId>io.pollinglib</groupId>
+    <artifactId>kairow</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+</dependency>
+```
+
+Configure a JDBC DataSource with the vendor driver and apply [the PostgreSQL schema](src/main/resources/io/pollinglib/schema.sql) or [the MySQL schema](src/main/resources/io/pollinglib/mysql.sql). Put this bean in a package scanned by your application:
+
+```java
+import io.pollinglib.KairowPoll;
+import io.pollinglib.PollingQueue;
+import org.springframework.stereotype.Component;
+
+@Component
+public class JobHandler {
+    @KairowPoll(table = "polling_job")
+    public void process(PollingQueue.Claim job) {
+        System.out.println("Processing " + job.id() + ": " + job.payload());
+    }
+}
+```
+
+For a quick check, insert a row in a fresh queue. Each replica can claim it; once its handler returns successfully the row becomes DONE.
+
+```sql
+INSERT INTO polling_job (id, payload, max_attempts)
+VALUES ('a65a8358-59af-4aa3-a33c-bf7294118e98', 'hello Kairow', 3);
+```
+
+## Modulo workers
+
+To partition the quick-start queue, replace the annotation on the same method with:
+
+```java
+@KairowPoll(table = "polling_job", strategy = KairowPoll.Strategy.MODULO,
+            shardIndex = "${kairow.shard-index}", shardCount = "${kairow.shard-count}")
+```
+
+For two instances, use the following settings on the first. Set shard-index to 1 on the second. If a shard has no live worker, its jobs wait for a replacement.
+
+```properties
+kairow.shard-index=0
+kairow.shard-count=2
+```
+
 ## Why Kairow?
 
 Kairow (pronounced *KAI-roh*) blends the Greek word *kairos*, meaning “the right moment,” with *row*, the PostgreSQL record that holds a job. A worker can claim that row when a new job is ready, a retry becomes due, or a previous worker’s lease expires. The name captures what the framework helps a worker find: the right row at the right moment.
@@ -84,7 +146,7 @@ Use a dedicated, empty PostgreSQL database. CI provisions PostgreSQL 16 and appl
 
 ## Automatic polling in Spring Boot 3
 
-Put Kairow on the application's classpath and annotate a public synchronous method on an eager singleton Spring bean. With a single or primary DataSource, Boot discovers the handler at startup, detects PostgreSQL or MySQL, and schedules one fixed-delay task per method. The application supplies the database driver and matching schema.
+Put Kairow on the application's classpath and annotate a public synchronous method on an eager singleton Spring bean. Boot discovers the handler at startup, resolves its DataSource and database adapter, and schedules one fixed-delay task per method. The application supplies the database driver and matching schema.
 
 ```java
 @KairowPoll(table = "kafka_outbox", idColumn = "event_id", payloadColumn = "event_body",
@@ -125,3 +187,16 @@ public void publish(PollingQueue.Claim event) {
 **Retries and metrics.** Fixed delay is the default. Exponential delay doubles per attempt up to the cap. Jitter of 0.2 samples between 80% and 100% of the capped delay. The row's max_attempts bounds deliveries; matching nonRetryable exceptions immediately fail the row. When a single or primary MeterRegistry bean is available, Kairow records kairow.claimed, kairow.completed, kairow.processing.failures, kairow.renewal.failures and kairow.processing.duration with table and handler tags. Processing failures include retryable, terminal and completion errors.
 
 **JUnit coverage.** Run `mvn verify` with PostgreSQL and the base schema. To include MySQL, also provision the MySQL test database as in the CI workflow and set `KAIROW_MYSQL_TEST=true`. The ordered-batch tests apply the actual companion migrations, exercise a competing transaction and verify retry and fencing behavior. The Spring integration test holds a handler open during shutdown and checks renewal, completion and metrics.
+
+## Pluggable data sources and database adapters
+
+```java
+@KairowPoll(table = "trade_outbox", dataSource = "${kairow.trade-source}")
+public void publishTrade(PollingQueue.Claim trade) {
+    publisher.sendAndAwaitAcknowledgment(trade.id(), trade.payload());
+}
+```
+
+Set `kairow.trade-source=tradesDataSource` to select an existing Spring JDBC DataSource bean. A literal bean name works too. Each handler can select its own pool. Omitting the attribute selects the single or primary DataSource. When several pools exist without a primary, name the pool on each handler. Kairow checks database metadata at startup and uses that same pool for claims, leadership, renewal, retries and completion. Run each queue migration on its selected database.
+
+PostgreSQL and MySQL have built-in backends. An adapter JAR can contribute a `QueueBackendProvider` bean via Spring Boot auto-configuration. Its `supports` method matches the JDBC product name; `create` receives that handler's QueueMapping. One matching provider takes precedence over the built-in adapter. Multiple matches fail startup. Custom adapters supply vendor SQL, migrations, lease renewal and the claim semantics their handlers require. The application's JDBC driver and connection pool still come from the host.

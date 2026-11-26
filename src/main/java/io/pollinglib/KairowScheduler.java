@@ -19,7 +19,6 @@ import org.springframework.core.env.Environment;
 final class KairowScheduler implements SmartLifecycle {
     private static final System.Logger LOG = System.getLogger(KairowScheduler.class.getName());
     private final ConfigurableListableBeanFactory beans;
-    private final DataSource source;
     private final Environment env;
     private final String owner = UUID.randomUUID().toString();
     private volatile ScheduledThreadPoolExecutor executor;
@@ -29,9 +28,8 @@ final class KairowScheduler implements SmartLifecycle {
     private volatile boolean stopping;
     private long graceMillis;
 
-    KairowScheduler(ConfigurableListableBeanFactory beans, DataSource source, Environment env) {
+    KairowScheduler(ConfigurableListableBeanFactory beans, Environment env) {
         this.beans = beans;
-        this.source = source;
         this.env = env;
     }
 
@@ -45,15 +43,19 @@ final class KairowScheduler implements SmartLifecycle {
         graceMillis = env.getProperty("kairow.shutdown-grace-millis", Long.class, 30000L);
         if (graceMillis < 0) throw new IllegalArgumentException("Invalid shutdown grace");
         var tasks = new ArrayList<Task>();
-        String database = null;
+        var products = new java.util.IdentityHashMap<DataSource,String>();
         for (String name : beans.getSingletonNames()) {
             Object bean = beans.getSingleton(name);
             if (bean == null) continue;
             Map<Method,KairowPoll> methods = MethodIntrospector.selectMethods(AopUtils.getTargetClass(bean),
                     (MethodIntrospector.MetadataLookup<KairowPoll>) method -> method.getAnnotation(KairowPoll.class));
             for (var entry : methods.entrySet()) {
-                if (database == null) database = databaseProduct();
-                tasks.add(bind(bean, entry.getKey(), entry.getValue(), database));
+                var options = entry.getValue();
+                String nameOfSource = env.resolveRequiredPlaceholders(options.dataSource()).trim();
+                DataSource source = nameOfSource.isEmpty() ? beans.getBean(DataSource.class)
+                        : beans.getBean(nameOfSource, DataSource.class);
+                String product = products.computeIfAbsent(source, this::databaseProduct);
+                tasks.add(bind(bean, entry.getKey(), options, source, product));
             }
         }
         workers = java.util.concurrent.Executors.newFixedThreadPool(Math.max(1, capacity));
@@ -64,7 +66,7 @@ final class KairowScheduler implements SmartLifecycle {
         for (var task : tasks) executor.scheduleWithFixedDelay(task.run(), 0, task.delay(), TimeUnit.MILLISECONDS);
     }
 
-    private String databaseProduct() {
+    private String databaseProduct(DataSource source) {
         try (var connection = source.getConnection()) {
             return connection.getMetaData().getDatabaseProductName();
         } catch (SQLException e) {
@@ -72,7 +74,7 @@ final class KairowScheduler implements SmartLifecycle {
         }
     }
 
-    private Task bind(Object bean, Method method, KairowPoll a, String database) {
+    private Task bind(Object bean, Method method, KairowPoll a, DataSource source, String database) {
         if (!Modifier.isPublic(method.getModifiers()) || Modifier.isStatic(method.getModifiers())
                 || method.getParameterCount() != 1 || method.getParameterTypes()[0] != PollingQueue.Claim.class
                 || method.getReturnType() != void.class)
@@ -85,11 +87,7 @@ final class KairowScheduler implements SmartLifecycle {
         capacity = Math.addExact(capacity, a.batchSize());
         var invocable = AopUtils.selectInvocableMethod(method, bean.getClass());
         var poller = new AnnotatedPoller(bean, invocable, a, mapping -> {
-            var backend = switch (database) {
-                case "PostgreSQL" -> QueueBackend.postgresql(mapping);
-                case "MySQL" -> QueueBackend.mysql(mapping);
-                default -> throw new IllegalArgumentException("Unsupported automatic Kairow backend: " + database);
-            };
+            var backend = backendFor(database, mapping);
             return switch (a.strategy()) {
                 case SHARED -> new PollingQueue(source, backend);
                 case SINGLE_ACTIVE -> PollingQueue.singleActive(source, backend, Duration.ofMillis(a.leaderLeaseMillis()));
@@ -140,6 +138,18 @@ final class KairowScheduler implements SmartLifecycle {
             renewal.cancel(false);
             metrics.elapsed(System.nanoTime() - started);
         }
+    }
+
+    private QueueBackend backendFor(String product, QueueMapping mapping) {
+        var matches = beans.getBeanProvider(QueueBackendProvider.class).stream()
+                .filter(provider -> provider.supports(product)).toList();
+        if (matches.size() > 1) throw new IllegalStateException("Multiple Kairow adapters for " + product);
+        if (matches.size() == 1) return matches.get(0).create(mapping);
+        return switch (product) {
+            case "PostgreSQL" -> QueueBackend.postgresql(mapping);
+            case "MySQL" -> QueueBackend.mysql(mapping);
+            default -> throw new IllegalArgumentException("Register a QueueBackendProvider for " + product);
+        };
     }
 
     private int shardNumber(String value) {

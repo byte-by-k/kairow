@@ -67,7 +67,10 @@ public final class QueueMapping {
         return mapping;
     }
 
-    PreparedStatement prepare(Connection tx, String template) throws SQLException {
+    /** Validated SQL names by logical key, including table, leader and configured ordering columns. */
+    public Map<String,String> identifiers() { return names; }
+
+    public PreparedStatement prepare(Connection tx, String template) throws SQLException {
         return tx.prepareStatement(SLOT.matcher(template).replaceAll(m -> names.get(m.group(1))));
     }
 }
