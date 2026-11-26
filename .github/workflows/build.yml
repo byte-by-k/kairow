@@ -28,6 +28,8 @@ jobs:
           java-version: '17'
           cache: maven
       - run: psql postgresql://postgres:postgres@localhost/polling -v ON_ERROR_STOP=1 -f src/main/resources/io/pollinglib/schema.sql
+      - name: Permit trigger migrations in the disposable MySQL test database
+        run: docker exec "${{ job.services.mysql.id }}" mysql -uroot -ptest -e 'SET GLOBAL log_bin_trust_function_creators = ON'
       - run: mysql -h 127.0.0.1 -ukairow -pkairow polling < src/main/resources/io/pollinglib/mysql.sql
       - run: mvn -B verify
         env:
