@@ -52,6 +52,18 @@ CREATE INDEX CONCURRENTLY polling_job_due_mod4 ON polling_job
     WHERE status IN ('READY','PROCESSING');
 ```
 
+## Single active poller
+
+Use one long-lived queue object per pod, and configure every pod for the same mode:
+
+```java
+var queue = PollingQueue.singleActive(dataSource, Duration.ofSeconds(30));
+```
+
+On each scheduled claim, the active pod renews its leadership in PostgreSQL, even when the queue is empty. Standbys check the leadership row and return an empty result without reading jobs. Renewal and the job claim share a transaction. If the leader stops renewing, another pod can take over on its next tick after expiry. Existing databases must apply the polling_leader CREATE TABLE statement at the end of schema.sql before enabling this mode.
+
+Choose a leadership lease longer than the largest expected gap between claim calls, including handler time for a synchronous worker. The job lease passed to claim protects each individual job separately. A paused handler may still be running after leadership changes; downstream operations must tolerate redelivery. Shared and modulo pollers bypass this gate, so coordinate the rollout across all replicas.
+
 ## Verify
 
 Use a dedicated, empty PostgreSQL database. CI provisions PostgreSQL 16 and applies the schema. For local tests apply the schema, set POLLING_TEST_URL to the JDBC URL with test credentials, then run `mvn verify`. Run `mvn install` to install io.pollinglib:kairow:0.1.0-SNAPSHOT locally.

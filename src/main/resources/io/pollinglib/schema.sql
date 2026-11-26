@@ -12,3 +12,9 @@ CREATE TABLE polling_job (
 );
 CREATE INDEX polling_job_due ON polling_job (available_at, id)
     WHERE status IN ('READY','PROCESSING');
+
+CREATE TABLE IF NOT EXISTS polling_leader (
+    queue_name text PRIMARY KEY,
+    token uuid NOT NULL,
+    expires_at timestamptz NOT NULL
+);

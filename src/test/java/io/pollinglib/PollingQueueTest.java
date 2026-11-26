@@ -14,6 +14,24 @@ class PollingQueueTest {
         return db;
     }
 
+    @Test void idleLeaderKeepsStandbyFromClaimingUntilExpiry() throws Exception {
+        var db = database();
+        var lease = Duration.ofMinutes(1);
+        var first = PollingQueue.singleActive(db, lease);
+        var standby = PollingQueue.singleActive(db, lease);
+        try (var tx = db.getConnection(); var sql = tx.createStatement()) {
+            sql.executeUpdate("DELETE FROM polling_leader WHERE queue_name='polling_job'");
+            assertTrue(first.claim("pod", lease).isEmpty());
+            var id = UUID.randomUUID();
+            first.enqueue(tx, id, "waiting", 2);
+            assertTrue(standby.claim("pod", lease).isEmpty());
+            sql.executeUpdate("UPDATE polling_leader SET expires_at=now() WHERE queue_name='polling_job'");
+            var claim = standby.claim("pod", lease).orElseThrow();
+            assertEquals(id, claim.id());
+            assertTrue(standby.complete(claim));
+        }
+    }
+
     @Test void moduloRoutesExistingRowsAndRetriesToTheirShard() throws Exception {
         var db = database();
         var shared = new PollingQueue(db);

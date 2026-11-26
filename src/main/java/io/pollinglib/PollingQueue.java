@@ -15,9 +15,17 @@ public final class PollingQueue {
     private final DataSource source;
 
     private final String shardFilter;
+    private final UUID leaderToken = UUID.randomUUID();
+    private final Duration leaderLease;
+
+    /** One active instance per database for the polling_job queue. */
+    public static PollingQueue singleActive(DataSource source, Duration leaderLease) {
+        if (leaderLease.toMillis() < 1) throw new IllegalArgumentException("Positive leader lease required");
+        return new PollingQueue(source, "", leaderLease);
+    }
 
     public PollingQueue(DataSource source) {
-        this(source, "");
+        this(source, "", null);
     }
 
     /** Restricts this worker to one zero-based shard of the job UUID hash. */
@@ -28,10 +36,11 @@ public final class PollingQueue {
         // Integer constants let PostgreSQL match an expression index for this shard count.
         String filter = " AND mod((('x' || left(md5(id::text), 8))::bit(32)::bigint), "
                 + shardCount + ") = " + shardIndex;
-        return new PollingQueue(source, filter);
+        return new PollingQueue(source, filter, null);
     }
 
-    private PollingQueue(DataSource source, String shardFilter) {
+    private PollingQueue(DataSource source, String shardFilter, Duration leaderLease) {
+        this.leaderLease = leaderLease;
         this.shardFilter = shardFilter;
         this.source = Objects.requireNonNull(source);
     }
@@ -63,6 +72,38 @@ public final class PollingQueue {
         if (owner == null || owner.isBlank() || lease.toMillis() < 1) {
             throw new IllegalArgumentException("Supply an owner and a positive lease of at least 1 ms");
         }
+        try (var connection = open()) {
+            if (leaderLease == null) return claimDue(connection, owner, lease);
+            connection.setAutoCommit(false);
+            try {
+                var result = acquireLeadership(connection)
+                        ? claimDue(connection, owner, lease) : Optional.<Claim>empty();
+                connection.commit();
+                return result;
+            } catch (SQLException | RuntimeException failure) {
+                connection.rollback();
+                throw failure;
+            }
+        }
+    }
+
+    private boolean acquireLeadership(Connection connection) throws SQLException {
+        String sql = """
+            INSERT INTO polling_leader (queue_name, token, expires_at)
+            VALUES ('polling_job', ?, clock_timestamp() + ? * interval '1 millisecond')
+            ON CONFLICT (queue_name) DO UPDATE SET token = excluded.token,
+                expires_at = clock_timestamp() + ? * interval '1 millisecond'
+            WHERE polling_leader.token = excluded.token OR polling_leader.expires_at <= clock_timestamp()
+            """;
+        try (var statement = connection.prepareStatement(sql)) {
+            statement.setObject(1, leaderToken);
+            statement.setLong(2, leaderLease.toMillis());
+            statement.setLong(3, leaderLease.toMillis());
+            return statement.executeUpdate() == 1;
+        }
+    }
+
+    private Optional<Claim> claimDue(Connection connection, String owner, Duration lease) throws SQLException {
         String sql = """
             WITH candidate AS (
                 SELECT id FROM polling_job
@@ -79,7 +120,7 @@ public final class PollingQueue {
             FROM candidate WHERE j.id = candidate.id
             RETURNING j.id, payload, attempts, claim_token
             """.formatted(shardFilter);
-        try (var connection = open(); var statement = connection.prepareStatement(sql)) {
+        try (var statement = connection.prepareStatement(sql)) {
             statement.setString(1, owner);
             statement.setLong(3, lease.toMillis());
             while (true) {
